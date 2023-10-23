@@ -5,6 +5,7 @@ import time
 import argparse
 from collections import Counter
 
+import wandb
 from torch.utils.data import DataLoader
 import torch
 from torchvision import transforms
@@ -23,7 +24,8 @@ from utils.visualize import generate_samples, plot_single_channel_imgs, plot_rgb
 from dataclasses import dataclass
 from schedulers.scheduling_ddim import DDIMScheduler
 from schedulers.scheduling_ddpm import DBADScheduler
-
+from efficientnet_pytorch import EfficientNet
+from torch.nn import functional as F
 
 @dataclass
 class TrainArgs:
@@ -31,9 +33,6 @@ class TrainArgs:
     log_dir: str
     run_name: str
     mvtec_item: str
-    flip: bool
-    rotate: bool
-    color_jitter: bool
     resolution: int
     epochs: int
     save_n_epochs: int
@@ -45,10 +44,10 @@ class TrainArgs:
     eta: float
     batch_size: int
     noise_kind: str
-    crop: bool
     plt_imgs: bool
     img_dir: str
     calc_val_loss: bool
+    crop: bool
 
 
 def parse_args() -> TrainArgs:
@@ -61,18 +60,12 @@ def parse_args() -> TrainArgs:
                         help='name of the run and corresponding checkpoints/logs that are created')
     parser.add_argument('--mvtec_item', type=str, required=True,
                         choices=["bottle", "cable", "capsule", "carpet", "grid", "hazelnut", "leather", "metal_nut",
-                                 "pill", "screw", "tile", "toothbrush", "transistor", "wood", "zipper"],
+                                 "pill", "screw", "tile", "toothbrush", "transistor", "wood", "zipper", "normal"],
                         help='name of the item within the MVTec Dataset to train on')
-    parser.add_argument('--resolution', type=int, default=128,
+    parser.add_argument('--resolution', type=int, default=224,
                         help='resolution of the images to generate (dataset will be resized to this resolution during training)')
-    parser.add_argument('--epochs', type=int, default=300,
+    parser.add_argument('--epochs', type=int, default=1000,
                         help='epochs to train for')
-    parser.add_argument('--flip', action='store_true',
-                        help='whether to augment training data with a flip')
-    parser.add_argument('--rotate', type=float, default=0,
-                        help='degree of rotation to augment training data with')
-    parser.add_argument('--color_jitter', type=float, default=0,
-                        help='amount of color jitter to augment training data with')
     parser.add_argument('--save_n_epochs', type=int, default=50,
                         help='write a checkpoint every n-th epoch')
     parser.add_argument('--train_steps', type=int, default=1000,
@@ -87,7 +80,7 @@ def parse_args() -> TrainArgs:
                         help='Influence of the original sample during inference (doesnt affect training)')
     parser.add_argument('--eta', type=float, default=0,
                         help='Stochasticity parameter of DDIM, with eta=1 being DDPM and eta=0 meaning no randomness. Only used during inference, not training.')
-    parser.add_argument('--batch_size', type=int, default=8,
+    parser.add_argument('--batch_size', type=int, default=64,
                         help='Batch size during training')
     parser.add_argument('--noise_kind', type=str, default="gaussian",
                         choices=["simplex", "gaussian"],
@@ -107,9 +100,9 @@ def parse_args() -> TrainArgs:
 def transform_imgs_test(imgs):
     augmentations = transforms.Compose(
         [
-            transforms.RandomCrop(args.resolution) if args.crop else transforms.Resize(args.resolution, interpolation=transforms.InterpolationMode.BILINEAR),
+            transforms.Resize(args.resolution, interpolation=transforms.InterpolationMode.BILINEAR),
             transforms.ToTensor(),
-            transforms.Normalize([0.5], [0.5]),
+            transforms.Normalize([0.485, 0.456, 0.406], [0.229, 0.224, 0.225]),
         ]
     )
 
@@ -119,12 +112,9 @@ def transform_imgs_test(imgs):
 def transform_imgs_train(imgs):
     augmentations = transforms.Compose(
         [
-            transforms.RandomCrop(args.resolution) if args.crop else transforms.Resize(args.resolution, interpolation=transforms.InterpolationMode.BILINEAR),
-            transforms.RandomHorizontalFlip() if args.flip else transforms.Lambda(lambda x: x),
-            transforms.RandomRotation(args.rotate),
-            transforms.ColorJitter(args.color_jitter, args.color_jitter, args.color_jitter),
+            transforms.Resize(args.resolution, interpolation=transforms.InterpolationMode.BILINEAR),
             transforms.ToTensor(),
-            transforms.Normalize([0.5], [0.5]),
+            transforms.Normalize([0.485, 0.456, 0.406], [0.229, 0.224, 0.225]),
         ]
     )
 
@@ -135,15 +125,16 @@ def main(args: TrainArgs):
     # -------------      load data      ------------
     data_train = MVTecDataset(args.dataset_path, True, args.mvtec_item, ["good"],
                               transform_imgs_train)
-    train_loader = DataLoader(data_train, batch_size=args.batch_size, shuffle=True)
-    test_data = MVTecDataset(args.dataset_path, False, args.mvtec_item, ["all"],
+    train_loader = DataLoader(data_train, batch_size=args.batch_size, shuffle=True, num_workers = 24)
+    test_data = MVTecDataset(args.dataset_path, False, 'bottle', ["all"],
                              transform_imgs_test)
-    test_loader = DataLoader(test_data, batch_size=2, shuffle=True)
+    test_loader = DataLoader(test_data, batch_size=args.batch_size, shuffle=False, num_workers = 24)
 
     # ----------- set model, optimizer, scheduler -----------------
     channel_multiplier = {
         128: (128, 128, 256, 384, 512),
-        256: (128, 128, 256, 256, 512, 512)
+        256: (128, 128, 256, 256, 512, 512),
+        224: (256, 512, 768, 1024)
     }
     down_blocks = ["DownBlock2D" for _ in channel_multiplier[args.resolution]]
     down_blocks[-2] = "AttnDownBlock2D"
@@ -152,8 +143,8 @@ def main(args: TrainArgs):
 
     model_args = {
         "sample_size": args.resolution,
-        "in_channels": 3,
-        "out_channels": 3,
+        "in_channels": 272,
+        "out_channels": 272,
         "layers_per_block": 2,
         "block_out_channels": channel_multiplier[args.resolution],
         "down_block_types": down_blocks,
@@ -162,7 +153,7 @@ def main(args: TrainArgs):
     model = UNet2DModel(
         **model_args
     )
-
+    feature_extractor = EfficientNet.from_pretrained('efficientnet-b4')
     noise_scheduler = DDPMScheduler(args.train_steps, beta_schedule=args.beta_schedule)
     inf_noise_scheduler = DDIMScheduler(args.train_steps, 150,
                                         beta_schedule=args.beta_schedule, timestep_spacing="leading",
@@ -170,7 +161,7 @@ def main(args: TrainArgs):
 
     optimizer = torch.optim.AdamW(
         model.parameters(),
-        weight_decay=1e-6,
+        weight_decay=1e-4,
         lr=1e-4,
         betas=(0.95, 0.999),
         eps=1e-08,
@@ -179,7 +170,7 @@ def main(args: TrainArgs):
     lr_scheduler = get_scheduler(
         "cosine",
         optimizer=optimizer,
-        num_warmup_steps=500,
+        num_warmup_steps=1500,
         num_training_steps=(len(train_loader) * args.epochs),
     )
     loss_fn = torch.nn.MSELoss()
@@ -191,7 +182,17 @@ def main(args: TrainArgs):
     run_id = f"{args.run_name}_{timestamp}"
     print(diffusers.utils.logging.is_progress_bar_enabled())
     diffusers.utils.logging.disable_progress_bar()
-
+    # use wandb to record the training loss
+    wandb.init(
+        # set the wandb project where this run will be logged
+        project="diffusionAD",
+        name="mvtec",
+        # track hyperparameters and run metadata
+        config={
+            "dataset": "mvtec",
+            "batch_size": 64
+        }
+    )
     # -----------------     train loop   -----------------
     print("**** starting training *****")
     print(f"run_id: {run_id}")
@@ -201,14 +202,21 @@ def main(args: TrainArgs):
     for epoch in range(args.epochs):
         model.train()
         model.to(args.device)
-
+        feature_extractor.to(args.device)
+        feature_extractor.eval()
         progress_bar = tqdm(total=len(train_loader) + len(test_loader))
         progress_bar.set_description(f"Epoch {epoch}")
 
         running_loss_train = 0
 
         for btc_num, (batch, _) in enumerate(train_loader):
-            loss = train_step(model, batch, noise_scheduler, lr_scheduler, loss_fn, optimizer, args.train_steps, args.noise_kind)
+            with torch.no_grad():
+                image_features = list(feature_extractor.extract_endpoints(batch.to(args.device)).values())[:-2]
+            for i in range(4):
+                image_features[i] = F.interpolate(image_features[i], size=(32, 32), mode='bilinear')
+            fea_cat = torch.cat(image_features, dim=1)
+            loss = train_step(model, fea_cat, noise_scheduler, lr_scheduler, loss_fn, optimizer, args.train_steps,
+                              args.noise_kind)
 
             running_loss_train += loss
             progress_bar.update(1)
@@ -217,19 +225,20 @@ def main(args: TrainArgs):
         with torch.no_grad():
             scores = Counter()
             for _btc_num, (_batch, _labels, gts) in enumerate(test_loader):
-                loss = validate_step(model, _batch, noise_scheduler, args.train_steps, loss_fn) if args.calc_val_loss else 0
+                loss = validate_step(model, _batch, noise_scheduler, args.train_steps,
+                                     loss_fn) if args.calc_val_loss else 0
 
                 running_loss_test += loss
 
                 writer.add_scalars(main_tag='scores', tag_scalar_dict=dict(scores), global_step=epoch)
                 progress_bar.update(1)
 
-            if epoch % 100 == 0:
-                # runs it only for the last batch
-                inference_ddim.run_inference_step(diffmap_blur, scores, gts, _btc_num, _batch, model,
-                                                  args.noise_kind, inf_noise_scheduler, _labels, writer, args.eta,
-                                                  15, 150, args.crop, args.plt_imgs,
-                                                  os.path.join(args.img_dir, run_id))
+            # if epoch % 100 == 0:
+            #     # runs it only for the last batch
+            #     inference_ddim.run_inference_step(diffmap_blur, scores, gts, _btc_num, _batch, model,
+            #                                       args.noise_kind, inf_noise_scheduler, _labels, writer, args.eta,
+            #                                       15, 150, args.crop, args.plt_imgs,
+            #                                       os.path.join(args.img_dir, run_id))
 
             for key in scores:
                 scores[key] /= len(test_loader)
@@ -243,6 +252,8 @@ def main(args: TrainArgs):
 
         writer.add_scalar('Loss/train', running_loss_train, epoch)
         writer.add_scalar('Loss/test', running_loss_test, epoch)
+        wandb.log({"loss_train": running_loss_train})
+        wandb.log({"loss_test": running_loss_test})
 
     writer.add_hparams({'category': args.mvtec_item, 'res': args.resolution, 'eta': args.eta,
                         'recon_weight': args.reconstruction_weight}, {'MSE': running_loss_test},

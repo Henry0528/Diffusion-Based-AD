@@ -18,8 +18,8 @@ from utils.metrics import scores, scores_batch
 from utils.visualize import generate_samples, plot_single_channel_imgs, plot_rgb_imgs, gray_to_rgb, \
     split_into_patches, add_overlay, add_batch_overlay
 from collections import Counter
-
-
+from efficientnet_pytorch import EfficientNet
+from torch.nn import functional as F
 @dataclass
 class InferenceArgs:
     num_inference_steps: int
@@ -57,9 +57,9 @@ def parse_args() -> InferenceArgs:
                         choices=["bottle", "cable", "capsule", "carpet", "grid", "hazelnut", "leather", "metal_nut",
                                  "pill", "screw", "tile", "toothbrush", "transistor", "wood", "zipper"],
                         help='name of the item within the MVTec Dataset to train on')
-    parser.add_argument('--mvtec_item_states', type=str, nargs="+", default="all",
+    parser.add_argument('--mvtec_item_states', type=str, nargs="+", default=["all"],
                         help="States of the mvtec items that should be used. Available options depend on the selected item. Set to 'all' to include all states")
-    parser.add_argument('--num_inference_steps', type=int, default=30,
+    parser.add_argument('--num_inference_steps', type=int, default=50,
                         help='At which timestep/how many timesteps should be regenerated')
     parser.add_argument('--start_at_timestep', type=int, default=300,
                         help='At which timestep/how many timesteps should be regenerated')
@@ -83,11 +83,10 @@ def parse_args() -> InferenceArgs:
                         help='Plot the images with matplot lib. I.e. call plt.show()')
     parser.add_argument('--patch_imgs', action='store_true',
                         help='If the image size is larger than the models input, split input into multiple patches and stitch it together afterwards.')
-    parser.add_argument('--batch_size', type=int, default=2,
+    parser.add_argument('--batch_size', type=int, default=64,
                         help='Number of images to process per batch')
 
     return InferenceArgs(**vars(parser.parse_args()))
-
 
 def main(args: InferenceArgs, writer: SummaryWriter):
     # train loop
@@ -104,7 +103,7 @@ def main(args: InferenceArgs, writer: SummaryWriter):
                               interpolation=transforms.InterpolationMode.BILINEAR) if not args.patch_imgs else transforms.Lambda(
                 lambda x: x),
             transforms.ToTensor(),
-            transforms.Normalize([0.5], [0.5]),
+            transforms.Normalize([0.485, 0.456, 0.406], [0.229, 0.224, 0.225]),
         ]
     )
 
@@ -124,7 +123,9 @@ def main(args: InferenceArgs, writer: SummaryWriter):
     model.load_state_dict(torch.load(f"{args.checkpoint_dir}/{args.checkpoint_name}"))
     model.eval()
     model.to(args.device)
-
+    feature_extractor = EfficientNet.from_pretrained('efficientnet-b4')
+    feature_extractor.to(args.device)
+    feature_extractor.eval()
     diffmap_blur = transforms.GaussianBlur(2 * int(4 * 4 + 0.5) +1, 4)
 
     with torch.no_grad():
@@ -136,7 +137,13 @@ def main(args: InferenceArgs, writer: SummaryWriter):
         eval_scores = Counter()
 
         for i, (imgs, states, gts) in enumerate(test_loader):
-            run_inference_step(diffmap_blur, eval_scores, gts, i, imgs, model, noise_kind,
+            imgs = imgs.to(args.device)
+            image_features = list(feature_extractor.extract_endpoints(imgs).values())[:-2]
+            for i in range(4):
+                image_features[i] = F.interpolate(image_features[i], size=(32, 32), mode='bilinear')
+            fea_cat = torch.cat(image_features, dim=1)
+            gts = gts.to(args.device)
+            run_inference_step(diffmap_blur, eval_scores, gts, i, fea_cat, model, noise_kind,
                                noise_scheduler_inference, states, writer, args.eta, args.num_inference_steps,
                                args.start_at_timestep, args.patch_imgs, args.plt_imgs, args.img_dir)
 
@@ -159,31 +166,31 @@ def run_inference_step(diffmap_blur, eval_scores, gts, btc_idx, imgs, model, noi
                                                                      patch_imgs,
                                                                      noise_kind)
     anomaly_maps = utils.anomalies.diff_map_to_anomaly_map(diffmaps, .3, diffmap_blur)
-    overlays = add_batch_overlay(originals, anomaly_maps)
+    # overlays = add_batch_overlay(originals, anomaly_maps)
     eval_scores.update(scores_batch(gts, anomaly_maps))
     for idx in range(len(gts)):
         if not os.path.exists(f"{img_dir}"):
             os.makedirs(f"{img_dir}")
 
-        plot_single_channel_imgs([gts[idx], diffmaps[idx], anomaly_maps[idx]],
-                                 ["ground truth", "diff-map", "anomaly-map"],
-                                 cmaps=['gray', 'viridis', 'gray'],
-                                 save_to=f"{img_dir}/{btc_idx}_{states[idx]}_heatmap.png", show_img=plt_imgs)
-        plot_rgb_imgs([originals[idx], reconstructions[idx], overlays[idx]], ["original", "reconstructed", "overlay"],
-                      save_to=f"{img_dir}/{btc_idx}_{states[idx]}.png", show_img=plt_imgs)
+        # plot_single_channel_imgs([gts[idx], diffmaps[idx], anomaly_maps[idx]],
+        #                          ["ground truth", "diff-map", "anomaly-map"],
+        #                          cmaps=['gray', 'viridis', 'gray'],
+        #                          save_to=f"{img_dir}/{btc_idx}_{states[idx]}_heatmap.png", show_img=plt_imgs)
+        # plot_rgb_imgs([originals[idx], reconstructions[idx], overlays[idx]], ["original", "reconstructed", "overlay"],
+        #               save_to=f"{img_dir}/{btc_idx}_{states[idx]}.png", show_img=plt_imgs)
 
-        if writer is not None:
-            for t, im in zip(history["timesteps"], history["images"]):
-                writer.add_images(f"{btc_idx}_{states[0]}_process", im[idx].unsqueeze(0), t)
+        # if writer is not None:
+        #     for t, im in zip(history["timesteps"], history["images"]):
+        #         writer.add_images(f"{btc_idx}_{states[0]}_process", im[idx].unsqueeze(0), t)
+        #
+        #     writer.add_images(f"{btc_idx}_{states[0]}_results (ori, rec, diff, pred, gt)", torch.stack(
+        #         [originals[idx], reconstructions[idx], gray_to_rgb(diffmaps[idx])[0], gray_to_rgb(anomaly_maps[idx])[0],
+        #          gray_to_rgb(gts[idx])[0]]))
 
-            writer.add_images(f"{btc_idx}_{states[0]}_results (ori, rec, diff, pred, gt)", torch.stack(
-                [originals[idx], reconstructions[idx], gray_to_rgb(diffmaps[idx])[0], gray_to_rgb(anomaly_maps[idx])[0],
-                 gray_to_rgb(gts[idx])[0]]))
 
-
-# if __name__ == '__main__':
-#     args: InferenceArgs = parse_args()
-#     writer = SummaryWriter(f'{args.log_dir}/{args.run_id}') if args.log_dir else None
-#     main(args, writer)
-#     writer.flush()
-#     writer.close()
+if __name__ == '__main__':
+    args: InferenceArgs = parse_args()
+    writer = SummaryWriter(f'{args.log_dir}/{args.run_id}') if args.log_dir else None
+    main(args, writer)
+    writer.flush()
+    writer.close()

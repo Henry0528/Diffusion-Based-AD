@@ -115,8 +115,8 @@ class DDIMReconstructionPipeline(DiffusionPipeline):
             image_shape = (
                 batch_size,
                 self.unet.config.in_channels,
-                self.unet.config.sample_size,
-                self.unet.config.sample_size,
+                original_images.shape[2],
+                original_images.shape[3],
             )
         else:
             image_shape = (batch_size, self.unet.config.in_channels, *self.unet.config.sample_size)
